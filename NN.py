@@ -15,6 +15,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer ,CountVectorizer
 from sklearn.model_selection import KFold,RepeatedKFold
 from sklearn.preprocessing import LabelEncoder,OneHotEncoder
 from sklearn.metrics import roc_auc_score as auc
+from sklearn.linear_model import LinearRegression
 from collections import defaultdict,Counter
 from tqdm import tqdm
 import gc
@@ -92,7 +93,7 @@ new_features = resource.groupby(['id'],as_index=False)[['quantity']].count()
 new_features = new_features.rename(columns={'quantity':'quantity_count'})
 combine_data = pd.merge(combine_data,new_features,how='left',on='id')
 
-new_features = resource.groupby(['id'],as_isendex=False)[['quantity']].sum()
+new_features = resource.groupby(['id'],as_index=False)[['quantity']].sum()
 new_features = new_features.rename(columns={'quantity':'quantity_sum'})
 combine_data = pd.merge(combine_data,new_features,how='left',on='id')
 
@@ -320,9 +321,9 @@ gc.collect()
 # In[10]:
 
 
-gc.collect()
+
 cols = ['project_title','project_essay','project_resource_summary']
-n_features = [400,1000,400]
+n_features = [400,2000,400]
 
 print(u'开始进行文本处理')
 for c_i,c in tqdm(enumerate(cols)):
@@ -402,7 +403,8 @@ combine_data = pd.concat([combine_data,cat_features],axis=1)
 combine_data = combine_data.drop(labels=drop_columns,axis=1,errors='ignore')
 float64_index = combine_data.select_dtypes(include=np.float64).columns
 combine_data[float64_index] = combine_data[float64_index].astype(np.float16)
-
+print (combine_data.info())
+print (combine_data.columns)
 
 # In[13]:
 
@@ -415,6 +417,8 @@ test_X = combine_data.loc[combine_data.is_train_data != 1 ,:].drop('is_train_dat
 del train_data,test_data,resource,combine_data,cat_features
 gc.collect()
 
+train_X.columns = train_X.columns.map(lambda x : str(x))
+test_X.columns = test_X.columns.map(lambda x : str(x))
 
 # # 至以上步骤我们已经完成了特征工程，下面进行模型搭建
 
@@ -430,6 +434,7 @@ n_splits = 5
 n_repeats = 1
 kf = RepeatedKFold(n_splits=n_splits,n_repeats=n_repeats,random_state=0)
 auc_buf=[]
+lgb_valid = []
 
 for train_index,valid_index in kf.split(train_X):
     print('Fold {}/{}'.format(cnt+1,n_splits))
@@ -495,23 +500,72 @@ for train_index,valid_index in kf.split(train_X):
     else:
         p_buf += np.array(p, dtype=np.float16)
     auc_buf.append(auc)
-    
-    cnt += 1
-    
-#     if cnt>0:
-#         break
         
     del lgb_clf,lgb_train,lgb_valid,p
     gc.collect()
+    cnt += 1
+    if cnt > 0:
+        break
 
 auc_mean = np.mean(auc_buf)
 auc_std = np.std(auc_buf)
-print('AUC = {:.6f} +/- {:.6f}'.format(auc_mean,auc_std))
+print('LGB_AUC = {:.6f} +/- {:.6f}'.format(auc_mean,auc_std))
 
-preds = p_buf/cnt
+#preds = p_buf/cnt
+lgb_predicts = p_buf/cnt
 
+xgb_params={
+    'eta': 0.05,
+    'max_depth': 4,
+    'subsample': 0.85,
+    'colsample_bytree': 0.25,
+    'min_child_weight': 3,
+    'objective': 'binary:logistic',
+    'eval_metric': 'auc',
+    'seed': 0,
+    'silent': 1,
+}
+
+
+xgb_cnt = 0
+xgb_pbuf = []
+xgb_auc_buf=[]
+for train_index,valid_index in kf.split(train_X):
+    print('Fold {}/{}'.format(cnt + 1, n_splits))
+    xgb_train = xgb.DMatrix(train_X.loc[train_index],
+                label=train_y[train_index])
+    xgb_valid = xgb.DMatrix(train_X.loc[valid_index],
+                label=train_y[valid_index])
+    watchlist = [(xgb_train,'train'),(xgb_valid,'valid')]
+    xgb_clf = xgb.train(xgb_params,xgb_train,5000,watchlist,maximize=True,verbose_eval=200,
+                        early_stopping_rounds=200)
+
+    p = xgb_clf.predict(train_X.loc[valid_index])
+    auc = roc_auc_score(train_y.loc[valid_index], p)
+
+    print('{} AUC: {}'.format(cnt, auc))
+
+    p = xgb_clf.predict(xgb.DMatrix(test_X))
+    if len(xgb_pbuf) == 0:
+        xgb_pbuf = np.array(p, dtype=np.float16)
+    else:
+        xgb_pbuf += np.array(p, dtype=np.float16)
+    xgb_auc_buf.append(auc)
+
+    del xgb_clf, xgb_train, xgb_valid, p
+    gc.collect()
+    xgb_cnt += 1
+    if xgb_cnt > 0:
+        break
+xgb_predicts =xgb_pbuf/xgb_cnt
+
+xgb_auc_mean = np.mean(xgb_auc_buf)
+xgb_auc_std = np.std(xgb_auc_buf)
+print('XGB_AUC = {:.6f} +/- {:.6f}'.format(xgb_auc_mean,xgb_auc_std))
+
+linear_clf = LinearRegression()
 # Prepare submission
-subm = pd.DataFrame()
-subm['id'] = id_test
-subm['project_is_approved'] = preds
-subm.to_csv('data/submission.csv', index=False,sep=',')
+# subm = pd.DataFrame()
+# subm['id'] = id_test
+# subm['project_is_approved'] = preds
+# subm.to_csv('data/submission.csv', index=False,sep=',')
